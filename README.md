@@ -1,7 +1,4 @@
-<p align="right">
-<img src="misc/baiun.jpg" alt="cat-baiun" width="300"/>
-<em>K. Kuznetsov</em>
-</p>
+<img src="misc/baiun.jpg" alt="cat-baiun" width="300" align="left"/>
 
 # Baiun
 
