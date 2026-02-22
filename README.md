@@ -1,7 +1,7 @@
-<figure>
+<p>
 <img src="misc/baiun.jpg" alt="cat-baiun" align="right" width="300"/>
-<figcaption><small>K. Kuznetsov</small></figcaption>
-</figure>
+<em>K. Kuznetsov</em>
+</p>
 
 # Baiun
 
