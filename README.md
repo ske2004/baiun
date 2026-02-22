@@ -1,5 +1,5 @@
-<p>
-<img src="misc/baiun.jpg" alt="cat-baiun" align="right" width="300"/>
+<p align="right">
+<img src="misc/baiun.jpg" alt="cat-baiun" width="300"/>
 <em>K. Kuznetsov</em>
 </p>
 
