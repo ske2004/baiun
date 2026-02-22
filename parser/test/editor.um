@@ -1,0 +1,1644 @@
+import (
+  "window.um"
+  "rect.um"
+  "th.um"
+  "image.um"
+  "canvas.um"
+  "input.um"
+  "coll.um"
+  "std.um"
+  "audio.um"
+
+  "../ui/notification.um"
+  "../ui/implvtbl.um"
+  "../ui/scrollbar.um"
+  "../ui/ui.um"
+  "../sfx/sfx.um"
+  "session.um"
+
+  "../dbg/dbg.um"
+  "../shared/shortcuts.um"
+  "../misc/hashname.um"
+  "../misc/tagset.um"
+  "../dbg/fps.um"
+  "../game/world_data.um"
+  "../shared/global.um"
+  "../data/resources.um"
+  "../game/world.um"
+  "atlas.um"
+  "../misc/util.um"
+  "../game/game.um"
+  "../misc/immcursor.um"
+  "../extern/extern.um"
+  "../shared/payload_trigger.um"
+  render_debug_info = "../dbg/render.um"
+  "../gfx/drawcmd.um"
+  "grid.um"
+  "neske.um"
+  "timer.um"
+  "font.um"
+  "../misc/strings.um"
+
+  "../../umbox/os/os.um"
+)
+
+type (
+  EntityListAction = enum {
+    none
+    remove
+    edit
+    duplicate
+    moveUp
+    moveDown
+  }
+
+  EditorResources = struct {
+    toolbarIcons: image::Image
+    tilesetImage: image::Image
+    superHotFire: image::Image
+    mainFont:     font::Font
+    pressFx:      audio::Sound
+    releaseFx:    audio::Sound
+  }
+
+  EditorEntities = struct {
+    entitySelected: int
+    list:           []world_data::EntityDesc
+  }
+
+  Action = interface {
+    do(editor: ^Editor)
+    undo(editor: ^Editor)
+  }
+
+  EntityPlace = struct {
+    ent: world_data::EntityDesc
+    index: int
+    selectId: str
+    action: enum {add; remove}
+  }
+
+  EntityTransformAction = struct {
+    id: str
+    from, to: rect::Rect
+  }
+
+  TilePlaceAction = struct {
+    at:    th::Vf2
+    layer: int
+    prev:  int
+    curr:  int
+  }
+
+  GroupedAction = struct {
+    action: Action
+    group:  uint
+  }
+
+  ActionBuf = struct {
+    actions: []GroupedAction
+    from:    int
+    to:      int
+    group:   uint
+  }
+
+  Emulator = struct {
+    rompath: str
+    neske:   neske::Neske
+  }
+
+  Editor = struct {
+    // Misc
+    doExit:          ^bool
+    debugTimer:      timer::Timer
+    showDebugInfo:   bool
+    showUiDebugInfo: bool
+    dimDebugInfo:    bool
+    mute:            bool
+    hideWindows:     bool
+
+    // Visual data
+    resources: EditorResources
+
+    // Editors
+    tilemapGrid:          grid::Grid
+    tilesetGrid:          grid::Grid
+    tilemapLayer:         int
+    tilemapShowAllLayers: bool
+    tileSelected:         th::Vf2
+    tileset:              atlas::Atlas
+    world:                world::World
+    isPlaying:            bool
+    entityBypass:         bool
+    entities:             EditorEntities
+    potentialRoom:        str // the room which is in the text box
+    currentRoom:          str
+    dirty:                bool
+    entitySearch:         str
+    actionBuf:            ActionBuf
+    emulator:             Emulator
+
+    // UI state
+    ui: ^ui::UI
+  }
+)
+
+fn findEntityIndex(entities: []world_data::EntityDesc, id: str): int {
+  for i, entity^ in entities {
+    if entity.id == id {
+      return i
+    }
+  }
+  return -1
+}
+
+fn findEntity(entities: []world_data::EntityDesc, id: str): ^world_data::EntityDesc {
+  for i, entity^ in entities {
+    if entity.id == id {
+      return entity
+    }
+  }
+  return null
+}
+
+fn doPlace(it: ^EntityPlace, editor: ^Editor, isDo: bool) {
+  editor.entities.entitySelected = -1
+
+  editor.dirty = true
+  if (it.action == .add) == isDo {
+    editor.entities.list = insert(editor.entities.list, it.index, it.ent)
+  } else {
+    editor.entities.list = delete(editor.entities.list, it.index)
+  }
+
+  editor.entities.entitySelected = findEntityIndex(editor.entities.list, it.selectId)
+}
+
+fn (it: ^EntityPlace) do(editor: ^Editor) {
+  doPlace(it, editor, true)
+}
+
+fn (it: ^EntityPlace) undo(editor: ^Editor) {
+  doPlace(it, editor, false)
+}
+
+fn (it: ^EntityTransformAction) do(editor: ^Editor) {
+  editor.dirty = true
+  rect := &findEntity(editor.entities.list, it.id).rect
+  rect ^= it.to
+}
+
+fn (it: ^EntityTransformAction) undo(editor: ^Editor) {
+  editor.dirty = true
+  rect := &findEntity(editor.entities.list, it.id).rect
+  rect ^= it.from
+}
+
+fn (it: ^TilePlaceAction) do(editor: ^Editor) {
+  editor.dirty = true
+  editor.world.setTile(it.layer, trunc(it.at.x), trunc(it.at.y), it.curr)
+}
+
+fn (it: ^TilePlaceAction) undo(editor: ^Editor) {
+  editor.dirty = true
+  editor.world.setTile(it.layer, trunc(it.at.x), trunc(it.at.y), it.prev)
+}
+
+fn (it: ^ActionBuf) do(action: Action) {
+  it.actions = slice(it.actions, 0, it.to)
+  it.actions = append(it.actions, GroupedAction{action, it.group})
+  it.to++
+}
+
+fn (it: ^ActionBuf) commit() {
+  it.group++
+}
+
+fn (it: ^ActionBuf) undo() {
+  if it.to == 0 || len(it.actions) == 0 {
+    return
+  }
+
+  it.to--
+  group := it.actions[it.to].group
+
+  for it.to >= 0 && it.actions[it.to].group == group {
+    it.to--
+  }
+
+  it.to++
+}
+
+fn (it: ^ActionBuf) redo() {
+  if it.to >= len(it.actions) {
+    return
+  }
+
+  group := it.actions[it.to].group
+
+  for it.to < len(it.actions) && it.actions[it.to].group == group {
+    it.to++
+  }
+}
+
+fn (it: ^ActionBuf) flush(editor: ^Editor) {
+  diff := it.to-it.from
+
+  if diff > 0 {
+    for i := 0; i < diff; i++ {
+      it.actions[it.from+i].action.do(editor)
+    }
+  } else {
+    for i := 0; i < abs(diff); i++ {
+      it.actions[it.from-i-1].action.undo(editor)
+    }
+  }
+
+  it.from = it.to
+}
+
+fn (editor: ^Editor) setTile(pos: th::Vf2, layer: int, tile: int) {
+  prev := editor.world.getTile(layer, trunc(pos.x), trunc(pos.y))
+  if prev == tile {
+    return
+  }
+
+  editor.actionBuf.do(TilePlaceAction{pos, layer, prev, tile})
+}
+
+fn (editor: ^Editor) transformEntity(id: str, to: rect::Rect) {
+  ent := findEntity(editor.entities.list, id)
+  
+  editor.actionBuf.do(EntityTransformAction{id, ent.rect, to})
+}
+
+fn getSelectId(editor: ^Editor): str {
+  if editor.entities.entitySelected == -1 {
+    return "<NULL>"
+  }
+
+  return editor.entities.list[editor.entities.entitySelected].id
+}
+
+fn (editor: ^Editor) removeEntity(index: int) {
+  editor.actionBuf.do(EntityPlace{
+    selectId: getSelectId(editor),
+    ent: editor.entities.list[index],
+    index: index,
+    action: .remove,
+  })
+}
+
+fn (editor: ^Editor) addEntity(entity: world_data::EntityDesc, index: int) {
+  editor.actionBuf.do(EntityPlace{
+    selectId: getSelectId(editor),
+    ent: entity,
+    index: index,
+    action: .add,
+  })
+  editor.actionBuf.commit()
+}
+
+fn updateZoom(init: real, plus: real): th::Vf2 {
+  zoom := util::clamp(init+(init*plus), 8, 128)
+
+  return {zoom, zoom}
+}
+
+fn roomToPath(room: str): str {
+  return "data/spiel/sc_"+room+".csv"
+}
+
+fn createEditorEntities(): EditorEntities {
+  return EditorEntities{list: []world_data::EntityDesc{}, entitySelected: -1}
+}
+
+fn editorLoadRoom(editor: ^Editor, room: str): bool {
+  dbg::logt("ed: loading world")
+  if data, err := util::readFileStr(roomToPath(room)); err.code == 0 {
+    worldData := world_data::load(editor.world, data, strings::startsWith(room, "advent"))
+    editor.world = worldData.world
+    editor.entities.list = worldData.entities
+    editor.entities.entitySelected = -1
+    return true
+  } else {
+    editor.world = world::fromTileset(editor.world.tileset)
+    editor.entities = createEditorEntities()
+  }
+  return false
+}
+
+fn editorSaveRoom(editor: ^Editor) {
+  dbg::logt("ed: saving world")
+  err := util::writeFileStr(roomToPath(editor.currentRoom), world_data::save(world_data::WorldData{editor.world, editor.entities.list, false}))
+  if err.code != 0 {
+    dbg::logt("ed: save failed: "+err.msg)
+    notification::put({.error, "Failed to save: "+err.msg})
+  }
+  editor.dirty = false
+}
+
+fn editorToggleGame(editor: ^Editor) {
+  if !editor.isPlaying {
+    err := game::start(world_data::WorldData{editor.world, editor.entities.list, false})
+    if err.code != 0 {
+      dbg::logt("ed: game start failed: "+err.msg)
+      notification::put({.error, "Failed to start game: "+err.msg})
+      return
+    } else {
+      editor.debugTimer.start()
+    }
+  } else {
+    editor.debugTimer.stop()
+    game::stop()
+  }
+  editor.isPlaying = !editor.isPlaying
+}
+
+fn getEntitySelectedIndex(entities: ^EditorEntities): int {
+  return entities.entitySelected
+}
+
+fn getEntitySelected(entities: ^EditorEntities): ^world_data::EntityDesc {
+  if entities.entitySelected < 0 {
+    return null
+  }
+
+  return &entities.list[entities.entitySelected]
+}
+
+type WorldEditCmd = struct {
+  showLayers: uint // 3 bits
+  rect: rect::Rect
+  grid: grid::Grid
+  world: ^world::World
+}
+
+fn (d: ^WorldEditCmd) draw(props: drawcmd::DrawProperties) {
+  const getcolor = fn (bit: bool): uint32 {
+    if bit {
+      return 0xFFFFFFFF
+    }
+    return 0xFFFFFF33
+  }
+
+  canvas::drawRect(0x777777FF, d.rect)
+  colors := []uint32{getcolor(d.showLayers&1>0), getcolor(d.showLayers&2>0), getcolor(d.showLayers&4>0)}
+
+  offset := d.grid.toScreen(th::Vf2{0, 0})
+
+  d.world.drawLayer(offset, -1, d.grid.s.x/32.0, colors[0])
+  d.world.drawLayer(offset, 0, d.grid.s.x/32.0, colors[1])
+  d.world.drawLayer(offset, 1, d.grid.s.x/32.0, colors[2])
+}
+
+fn getShownLayersBitmap(layerSelected: int, showAllLayers: bool): uint {
+  return 1<<(layerSelected+1)|(int(showAllLayers)*0x7)
+}
+
+fn drawLayerIcon(rect: rect::Rect, layer: int, showAllLayers: bool) {
+  fills := showAllLayers ? 
+    [3]bool{true, true, true} : 
+    [3]bool{layer == -1, layer == 0, layer == 1}
+
+  scale := rect.h/48.0
+
+  position := rect.centerWithinRect({0, 0, 24*scale, 36*scale}).getPos()
+
+  position.x += 26*scale
+
+  for i, l in fills {
+    rec := rect::Rect{position.x-27*scale, position.y+3*scale, 30*scale, 18*scale}
+    position.x -= 3*scale
+    position.y += 6*scale
+
+    if l {
+      if i-1 == layer {
+        canvas::drawRect(0xf0b5afFF, rec)
+      } else {
+        canvas::drawRect(0x8c4841FF, rec)
+      }
+      canvas::drawRectLines(0xFFFFFFFF, rec, 1)
+    } else {
+      canvas::drawRect(0x99a9a9a9, rec)
+      canvas::drawRectLines(0xFFFFFFFF, rec, 1)
+    }
+  }
+}
+
+type GameCmd = struct {}
+
+fn (gc: ^GameCmd) draw(props: drawcmd::DrawProperties) {
+  game::draw()
+}
+
+fn appendEntity(editor: ^Editor, entity: world_data::EntityDesc) {
+  editor.addEntity(entity, len(editor.entities.list))
+}
+
+fn allocateEntityId(entities: []world_data::EntityDesc): str {
+  id := hashname::random()
+  for findEntity(entities, id) != null {
+    dbg::logt("allocateEntityId: regenerating id!!")
+    id = hashname::random()
+  }
+  return id
+}
+
+fn makeRandomEntity(id: str): world_data::EntityDesc {
+  return world_data::EntityDesc{name: id, id: id, tags: ""}
+}
+
+fn selectEntity(entities: ^EditorEntities, index: int) {
+  entities.entitySelected = index
+}
+
+fn isEntitySelected(entities: ^EditorEntities, index: int): bool {
+  return entities.entitySelected == index
+}
+
+fn initEntityAtCenter(editor: ^Editor, ent: world_data::EntityDesc): world_data::EntityDesc {
+  ent.rect = rect::Rect{-editor.tilemapGrid.p.x*32-16, -editor.tilemapGrid.p.y*32-16, 32, 32}
+  return ent
+}
+
+fn cloneEntity(entities: []world_data::EntityDesc, ent: world_data::EntityDesc): world_data::EntityDesc {
+  ent.id = allocateEntityId(entities)
+  return ent
+}
+
+fn doEntityAction(ui: ^ui::UI, editor: ^Editor, action: EntityListAction, i: int) {
+  moveFrom := -1
+  moveTo := -1
+
+  switch action {
+    case .moveUp:
+      moveFrom = i
+      moveTo = i-1
+      editor.dirty = true
+    case .moveDown:
+      moveFrom = i
+      moveTo = i+1
+      editor.dirty = true
+    case .remove:
+      editor.removeEntity(i)
+    case .edit:
+      selectEntity(&editor.entities, i)
+      implvtbl::VTBLImpl(ui.vtbl).wm.show("Entity Editor")
+    case .duplicate:
+      editor.addEntity(cloneEntity(editor.entities.list, editor.entities.list[i]), i+1)
+      selectEntity(&editor.entities, i+1)
+  }
+
+  if moveFrom != -1 && moveTo != -1 && moveFrom < len(editor.entities.list) && moveTo < len(editor.entities.list) {
+    if getEntitySelectedIndex(&editor.entities) == moveFrom {
+      selectEntity(&editor.entities, moveTo)
+    }
+
+    ent := editor.entities.list[moveFrom]
+    editor.entities.list[moveFrom] = editor.entities.list[moveTo]
+    editor.entities.list[moveTo] = ent
+  }
+}
+
+type RectResizeCommand = struct {
+  posFactor: th::Vf2   // Factor to multiply MouseDelta by to move the rectangle
+  sizeFactor: th::Vf2  // Factor to multiply MouseDelta by to resize the rectangle
+}
+
+type EditGrip = struct {
+  position: th::Vf2
+  resizeCommand: RectResizeCommand
+}
+
+fn applyRectResizeCommand(resizeCommand: RectResizeCommand, r: rect::Rect, delta: th::Vf2): rect::Rect {
+  r.x += delta.x * resizeCommand.posFactor.x
+  r.y += delta.y * resizeCommand.posFactor.y
+  r.w += delta.x * resizeCommand.sizeFactor.x
+  r.h += delta.y * resizeCommand.sizeFactor.y
+  return r
+}
+
+fn drawTaggedEntityRect(editor: ^Editor, entity: ^world_data::EntityDesc, r: rect::Rect, tags: ^tagset::TagSet) {
+  if tags.isSet("Guide") {
+    canvas::drawRectLines(th::yellow, r)
+  } else if tags.isSet("Comment") {
+    editor.resources.mainFont.draw(entity.name, th::Vf2{r.x, r.y}, th::white, editor.tilemapGrid.s.x/32)
+  } else {
+    if !game::drawEntityObject(entity.name, tags, r, editor.tilemapGrid.s.x/32) {
+      canvas::drawRect(th::red, r)
+    }
+  }
+}
+
+fn adjustEntityRect(editor: ^Editor, tags: ^tagset::TagSet, ent: ^world_data::EntityDesc): rect::Rect {
+  r := ent.rect
+
+  if r.w < 10 {
+    r.w = 10
+  }
+  if r.h < 10 {
+    r.h = 10
+  }
+
+  if tags.isSet("Comment") {
+    size := editor.resources.mainFont.measure(ent.name)
+    r.w = size.x
+    r.h = size.y
+  }
+
+  return r
+}
+
+fn (editor: ^Editor) zoomToCenter() {
+  bb := editor.world.getBoundingBox()
+  // @NOTE: Dont zoom too much, prevent 0 division.
+  if bb.w < 30 { bb.w = 30 }
+  if bb.h < 30 { bb.h = 30 }
+
+  scaleX := editor.tilemapGrid.bb.w/bb.w
+  scaleY := editor.tilemapGrid.bb.h/bb.h
+
+  scale := util::min(scaleX, scaleY)
+
+  if scale < 8 { scale = 8 }
+
+  editor.tilemapGrid.s = {scale, scale}
+  editor.tilemapGrid.p = bb.center().mulf(-1)
+}
+
+
+fn loadRoom(editor: ^Editor, room: str) {
+  editor.dirty = false
+  editor.actionBuf = {}
+  editor.currentRoom = room
+  editor.potentialRoom = room
+  editorLoadRoom(editor, room)
+  editor.zoomToCenter()
+}
+
+
+type GridInteraction = struct {
+  commit:  bool
+  placed:  bool
+  panning: bool
+  removed: bool
+  pos:     th::Vf2
+}
+
+fn putGrid(grid: ^grid::Grid, ui: ^ui::UI): GridInteraction {
+  ps := &GridInteraction{}
+
+  ui.col(|ps, grid| {
+    ui.pushIdStr("Grid")
+
+    if ui.isActive() {
+      if input::isPressed(.mouse2) || input::isPressed(.space) {
+        ps.panning = true
+        grid.pan(input::getMouseDelta())
+      }
+      if input::isPressed(.mouse1) {
+        ps.placed = true
+        ps.pos = grid.toGridCell(input::getMousePos())
+      }
+      if input::isPressed(.mouse3) {
+        ps.removed = true
+        ps.pos = grid.toGridCell(input::getMousePos())
+      }
+      if input::isJustReleased(.mouse1) || input::isJustReleased(.mouse3) {
+        ps.commit = true
+      }
+    }
+
+    hovered := false
+    if ui.isHovered() || ui.isActive() {
+      hovered = true
+      wheel := input::getMouseScroll().y
+      grid.zoomInto(updateZoom(grid.s.x, wheel/10.0), input::getMousePos())
+    }
+
+    ui.drawCustom(|ui, hovered, grid| {
+      grid.bb = dest
+      grid.o = dest.getDims().divf(2)
+      grid.draw(0xFFFFFF11, 1)
+      if hovered {
+        gridPos := grid.toGridCell(input::getMousePos())
+        screenPos1 := grid.toScreen(gridPos)
+        screenPos2 := grid.toScreen(gridPos.add({1, 1}))
+        canvas::drawRect(0xFFFFFF22, {screenPos1.x, screenPos1.y, screenPos2.x-screenPos1.x, screenPos2.y-screenPos1.y})
+
+        // Draw hovered over coordinates.
+        coordinates := sprintf("%v, %v", gridPos.x, gridPos.y)
+        coordinatesTxtSz := ui.font.measure(coordinates).mulf(ui.io.scale)
+        coordinatesTxtPos := th::Vf2{dest.x+10*ui.io.scale, dest.y+(dest.h-coordinatesTxtSz.y-10*ui.io.scale)}
+        ui.font.draw(coordinates, coordinatesTxtPos, th::white, ui.io.scale)
+      }
+    })
+    ui.popId()
+  })
+
+  return ps^
+}
+
+fn (editor: ^Editor) putNotifications(ui: ^ui::UI) {
+  ui.cellPos({0, 0})
+  ui.cellPadding(5)
+  ui.col(|editor| {
+    ns := notification::get()
+
+    for i in ns {
+      n := ns[len(ns^)-i-1]
+      ui.cellPadding(10)
+      ui.row(|n, editor| {
+        ui.boxStyle(.notification)
+        // @MARK(UiResourceManagment)
+        ui.img2(editor.resources.toolbarIcons, {24*int(n.info.icon), 144, 24, 24})
+        ui.label(" ")
+        ui.label(n.info.message)
+      })
+    }
+  })
+}
+
+fn (editor: ^Editor) putEntityEditor(ui: ^ui::UI) {
+  entitySelected := getEntitySelected(&editor.entities)
+
+  if entitySelected != null {
+    ui.window("Entity Editor", |editor, entitySelected| {
+      ui.cellStretch()
+      ui.cellAlign(0.5)
+
+      tags := tagset::mk(entitySelected.tags)
+
+      if tags.isSet("Comment") {
+        ui.row(|editor, entitySelected| {
+          ui.cellJustify(0.5)
+          ui.label("Comment")
+          ui.cellJustify(1)
+          editor.dirty = ui.textEditSingle("Comment", &entitySelected.name) || editor.dirty
+        })
+      }
+
+      ui.cellStretch()
+      ui.cellAlign(0.5)
+      ui.row(|editor, entitySelected| {
+        ui.cellJustify(0.5)
+        ui.label("Id")
+        ui.cellJustify(1)
+        editor.dirty = ui.textEditSingle("Id", &entitySelected.id) || editor.dirty
+      })
+
+      ui.cellStretch()
+      ui.cellAlign(0.5)
+      ui.row(|editor, entitySelected| {
+        ui.cellJustify(0.5)
+        ui.label("Tags")
+        ui.cellJustify(1)
+        editor.dirty = ui.textEditSingle("Tags", &entitySelected.tags) || editor.dirty
+      })
+
+      ui.spring(1)
+
+      ui.cellStretch()
+      if editor.ui.button("Delete") {
+        editor.removeEntity(getEntitySelectedIndex(&editor.entities))
+        editor.dirty = true
+      }
+    })
+  }
+}
+
+fn matchSearch(needle: str, haystack: str): bool {
+  return strings::search(strings::toLowerS(needle), strings::toLowerS(haystack))
+}
+
+fn matchEnt(ent: ^world_data::EntityDesc, query: str): bool {
+  return matchSearch(query, ent.id) ||
+         matchSearch(query, ent.tags)
+}
+
+fn (editor: ^Editor) putEntityList(ui: ^ui::UI) {
+  ui.window("Entity List", |editor| {
+    _actions := map[int]EntityListAction{}
+    actions := &_actions
+
+    ui.cellStretch()
+    ui.textEditSingle("Search", &editor.entitySearch)
+
+    ui.cellStretch()
+    ui.cellJustify(1)
+    ui.cellClip()
+    var _scrollbar: ^scrollbar::Scrollbar = null
+    _scrollbar_ptr := &_scrollbar
+
+    ui.scrollArea(|_scrollbar_ptr, editor, actions| {
+      _scrollbar_ptr ^= scrollbar
+      for i, ent^ in editor.entities.list {
+        if !matchEnt(ent, editor.entitySearch) {
+          continue
+        }
+
+        ui.cellStretch()
+        ui.row(|editor, actions, ent, i| {
+          ui.pushIdStr(ent.id)
+          if ui.isHidden() {
+            ui.buttonSpacer()
+            ui.popId()
+            return
+          }
+
+          action := EntityListAction.none
+
+          if i == editor.entities.entitySelected {
+            ui.drawCustom({
+              // @TODO: This isn't very visible now since the other cover it.
+              canvas::drawRectLines(0xFFFF00FF, dest, 4)
+            })
+          }
+
+          ui.cellStretch()
+          ui.cellJustify(1)
+          if ui.button(ent.id) { action = .edit }
+          _action := &action
+          ui.cellStretch()
+          ui.col(|_action| {
+            ui.cellJustify(1)
+            if ui.button("▲") { _action ^= .moveUp }
+            ui.cellJustify(1)
+            if ui.button("▼") { _action ^= .moveDown }
+          })
+
+          if input::isPressed(.shift) {
+            if ui.button("␡") { action = .remove }
+          } else {
+            if ui.button("⎘") { action = .duplicate }
+          }
+          ui.popId()
+
+          if action != .none {
+            actions[i] = action
+          }
+        })
+      }
+
+    })
+
+    // @HACK: There should be a better way to put elements on the titlebar.
+    r := implvtbl::VTBLImpl(ui.vtbl).wm.windows["Entity List"].viewRect
+    buttonRect := rect::Rect{r.x+r.w-34-5, r.y+5, 34, 34}
+    ui.cellUnclip()
+    ui.cellRect(buttonRect)
+    if ui.button("+") {
+      appendEntity(editor, initEntityAtCenter(editor, makeRandomEntity(allocateEntityId(editor.entities.list))))
+      editor.dirty = true
+      _scrollbar.overflow = true
+    }
+
+    // For now, only one action can be applied at a time, due to indexing.
+    std::assert(len(_actions) < 2)
+
+    for i, action in actions {
+      doEntityAction(ui, editor, action, i)
+    }
+  })
+}
+
+type Option = struct {
+  tags: str
+  size: th::Vf2
+}
+
+fn (editor: ^Editor) putQuickAdd*(ui: ^ui::UI) {
+  options := map[str]Option{
+    "Player":   {"player", {32, 32}},
+    "Guide":    {"Guide",  {640, 480}},
+    "TeleFrom": {"tele",  {5*32, 5*32}},
+    "TeleTo":   {"tele_off",  {5*32, 5*32}},
+    "Boulder":  {"boulder", {32, 64}},
+    "Lever":    {"lever", {32, 32}},
+    "LeverS":   {"lever_s", {32, 32}},
+    "Comment":  {"Comment", {32, 32}}
+  }
+
+  ui.window("Quick Add", |editor, options| {
+    for i, option in options {
+      ui.cellStretch()
+      ui.cellJustify(1)
+      if ui.button(i) {
+        ent := initEntityAtCenter(editor, makeRandomEntity(allocateEntityId(editor.entities.list)))
+        ent.rect.w = option.size.x
+        ent.rect.h = option.size.y
+        ent.tags = option.tags
+        appendEntity(editor, ent)
+        editor.entities.entitySelected = len(editor.entities.list)-1
+        editor.dirty = true
+        implvtbl::VTBLImpl(ui.vtbl).wm.toggle("Quick Add")
+      }
+    }
+  })
+}
+
+fn selectBtn(ui: ^ui::UI, text: str, current: ^int, value: int): bool {
+  flags := 0
+  
+  if current^ == value {
+    flags = ui::buttonFlagPushed
+    ui.cellColor(0x777777FF)
+  }
+
+  if ui.button(text, flags) {
+    current ^= value
+    return true
+  }
+  return false
+}
+
+fn (editor: ^Editor) putToolbar(ui: ^ui::UI) {
+  ui.cellPadding(5)
+  ui.col(|editor| {
+    if !editor.isPlaying {
+      ui.boxStyle(.toolbar)
+    }
+
+    windowBtn := fn (name: str, rect: rect::Rect) |ui, editor| {
+      if ui.button2(name, |editor, rect| {ui.img2(editor.resources.toolbarIcons, rect)}, implvtbl::VTBLImpl(ui.vtbl).wm.isOpen(name) ? ui::buttonFlagPushed : 0) {
+        implvtbl::VTBLImpl(ui.vtbl).wm.toggle(name)
+      }
+    }
+
+    windowBtnStub := fn (name: str, rect: rect::Rect) |ui| {
+      ui.cellPadding(5)
+      ui.row(|rect| {
+        ui.stub(rect.getDims())
+      })
+    }
+
+    windowBtnIf := fn (name: str, rect: rect::Rect, cond: bool) |windowBtn, windowBtnStub| {
+      if cond {
+        windowBtn(name, rect)
+      } else {
+        windowBtnStub(name, rect)
+      }
+    }
+
+    iconBtn := fn (name: str, rect: rect::Rect, flags: uint = 0): bool |ui, editor| {
+      return ui.button2(name, |editor, rect| {ui.img2(editor.resources.toolbarIcons, rect)}, flags)
+    }
+
+    // @TODO: Remove the hardcoded texture regions.
+    if iconBtn("Play", {48, 48, 48, 48}, editor.isPlaying ? ui::buttonFlagPushed : 0) {
+      editorToggleGame(editor)
+    }
+
+    windowBtn("Console", {48, 0, 48, 48})
+    windowBtn("Settings", {96, 192, 48, 48})
+
+    if editor.isPlaying {
+      windowBtn("Level Select", {48*3, 48*3, 48, 48})
+      return
+    }
+
+    windowBtn("Room", {48*2, 48*2, 48, 48})
+    windowBtn("Tile Picker", {48*0, 48, 48, 48})
+    windowBtn("Entity List", {48*0, 48*2, 48, 48})
+    windowBtn("FC Emulator", {48*0, 48*4, 48, 48})
+
+    windowBtnIf("Entity Editor", {48*1, 48*2, 48, 48}, editor.entities.entitySelected != -1)
+
+    flags := editor.entityBypass ? ui::buttonFlagPushed : 0
+    ui.spring(1)
+    ui.cellStretch()
+    if editor.entityBypass { ui.cellColor(0x777777FF) }
+    if ui.button("🔒", flags) {
+      editor.entityBypass = !editor.entityBypass
+    }
+    ui.cellStretch()
+    selectBtn(ui, "FG", &editor.tilemapLayer, 1)
+    ui.cellStretch()
+    selectBtn(ui, "MG", &editor.tilemapLayer, 0)
+    ui.cellStretch()
+    selectBtn(ui, "BG", &editor.tilemapLayer, -1)
+    ui.cellStretch()
+    if ui.button("> <") {
+      editor.zoomToCenter()
+    }
+    ui.cellStretch()
+    ui.cellSameSize()
+    layersPressed := ui.button2("Layers", |editor| {
+      ui.drawCustom(|editor| {
+        drawLayerIcon(dest, editor.tilemapLayer, editor.tilemapShowAllLayers)
+      })
+    })
+    if layersPressed {
+      editor.tilemapShowAllLayers = !editor.tilemapShowAllLayers
+    }
+    if iconBtn("Exit", {48, 192, 48, 48}) {
+      editor.doExit ^= true
+    }
+  })
+}
+
+fn (editor: ^Editor) putWindows(ui: ^ui::UI) {
+  if editor.hideWindows {
+    return
+  }
+
+  if !editor.isPlaying {
+    editor.putEntityEditor(ui)
+    editor.putEntityList(ui)
+
+
+    ui.window("Action Log", |editor| {
+      groups := map[int]struct{count: int; undone: bool}{}
+
+      for i, action in editor.actionBuf.actions {
+        group := &groups[action.group]
+        group.count++
+        group.undone = editor.actionBuf.to <= i
+      }
+
+      for group, info in groups {
+        // @TODO(Theming)
+        color := info.undone ? 0x777777FF : 0x000000FF
+        ui.cellColor(color)
+        ui.label(sprintf("%3d * Group %d", info.count, group))
+      }
+    })
+
+    ui.window("Room", |editor| {
+      ui.label("Room name: ")
+
+      ui.cellStretch()
+      ui.textEditSingle("Room name", &editor.potentialRoom)
+     
+      ui.cellStretch()
+      ui.row(|editor| {
+        ui.cellJustify(1)
+        if ui.button("Load") {
+          loadRoom(editor, editor.potentialRoom)
+        }
+
+        ui.cellJustify(1)
+        if ui.button("Save") {
+          editorSaveRoom(editor)
+        }
+        ui.cellJustify(1)
+        if ui.button("Reload") {
+          editorLoadRoom(editor, editor.currentRoom)
+        }
+      })
+
+    })
+
+    editor.putQuickAdd(ui)
+
+    ui.window("Tile Picker", |editor| {
+      ui.cellJustify(1)
+      ui.cellStretch()
+      interaction := putGrid(&editor.tilesetGrid, ui)
+
+      if interaction.placed {
+        // check if the tile isn't ouside the tileset bounds
+        dims := editor.resources.tilesetImage.getDims().divf(64)
+        rect := rect::Rect{0, 0, dims.x-1, dims.y-1}
+        if coll::vf2ToRect(interaction.pos, rect) {
+          editor.tileSelected = interaction.pos
+        }
+      }
+
+      ui.drawCustom(|editor| {
+        canvas::drawRect(0x222222FF, dest)
+        editor.tileset.i.crop(th::Vf2{0, 0}, th::Vf2{1, 1})
+        editor.tileset.i.draw({p: editor.tilesetGrid.toScreen({0, 0}), s: editor.tilesetGrid.s.divf(64)})
+
+        p := editor.tilesetGrid.toScreen(editor.tileSelected)
+        canvas::drawRectLines(0x00FF0099, {p.x, p.y, editor.tilesetGrid.s.x, editor.tilesetGrid.s.y}, 1)
+      })
+    })
+  } else {
+    ui.window("Level Select", |editor| {
+      ui.cellStretch()
+      ui.cellJustify(1)
+      ui.cellClip()
+      ui.scrollArea(|editor| {
+        type Level = struct { id, name: str }
+
+        levels := []Level{}
+
+        for i, ent in editor.entities.list {
+          if strings::startsWith(ent.id, "stage") {
+            levels = append(levels, Level{ent.id, ent.name})
+          }
+        }
+
+        sort(levels, true, id)
+
+        for i, level in levels {
+          ui.cellStretch()
+          if ui.button(level.id) {
+            game::tele(level.id)
+          }
+        }
+      })
+    })
+  }
+  
+  ui.window("Settings", |editor| {
+    ui.cellStretch()
+    if ui.button("Reset UI") {
+      implvtbl::VTBLImpl(ui.vtbl).wm.reset()
+    }
+    ui.cellStretch()
+    if ui.button("Plain Biscuit", uint(global::plainBiscuit)) {
+      global::plainBiscuit = !global::plainBiscuit
+    }
+    ui.label("(Removes visual\nclutter)")
+    ui.cellStretch()
+    if ui.button("Mute", uint(editor.mute)) {
+      editor.mute = !editor.mute
+    }
+  }, true)
+
+  ui.window("Console", {
+    // @TODO: This will block the window dragging, to fix that I should implement a way to mask which events are handled by the element.
+    ui.pushIdStr("Console")
+
+    if ui.isHovered() {
+      dbg::scrollConsole(input::getMouseScroll().y)
+    }
+
+    ui.drawCustom(|ui| {
+      dbg::drawConsole(dest, ui.font, ui.io.scale)
+    })
+
+    ui.popId()
+  })
+
+  ui.window("FC Emulator", |editor| {
+    ui.cellStretch()
+    ui.row(|editor| {
+      ui.cellJustify(1)
+      ui.textEditSingle("ROM Path", &editor.emulator.rompath)
+
+      if ui.button("Load") {
+        neske, err := neske::mk(editor.emulator.rompath)
+        if err.code != 0 {
+          notification::put({.error, err.msg})
+          return
+        }
+
+        editor.emulator.neske = neske
+      }
+    })
+
+    ui.cellJustify(1)
+    ui.cellStretch()
+    ui.col(|editor| {
+      ui.pushIdStr("FC Emulator")
+
+      if ui.isFocused() {
+        editor.emulator.neske.handleInput()
+      }
+
+      ui.popId()
+
+      ui.drawCustom(|editor| {
+        if !editor.emulator.neske.valid() {
+          return
+        }
+
+        frame, err := editor.emulator.neske.getFrame()
+        if err.code != 0 {
+          notification::put({.error, err.msg})
+          return
+        }
+        
+        bestScale := floor(util::min(dest.w/256, dest.h/240))
+        if bestScale < 1 { bestScale = 1 }
+        frame.blit({0, 0, 256, 240}, {dest.x+(dest.w-256*bestScale)/2, dest.y+(dest.h-240*bestScale)/2, 256*bestScale, 240*bestScale})
+      })
+    })
+  })
+}
+
+fn (editor: ^Editor) putRectGrips(ui: ^ui::UI, r: rect::Rect): RectResizeCommand {
+  // Grips positions are initialized as relative here.
+  // Will be multiplied by rect.w/h and added rect.x/y to them.
+  eightGrips := []EditGrip{
+    {{0.0, 0.0}, {{1, 1}, {-1, -1}}},
+    {{0.5, 0.0}, {{0, 1}, { 0, -1}}},
+    {{1.0, 0.0}, {{0, 1}, { 1, -1}}},
+
+    {{0.0, 0.5}, {{1, 0}, {-1,  0}}},
+    {{1.0, 0.5}, {{0, 0}, { 1,  0}}},
+
+    {{0.0, 1.0}, {{1, 0}, {-1,  1}}},
+    {{0.5, 1.0}, {{0, 0}, { 0,  1}}},
+    {{1.0, 1.0}, {{0, 0}, { 1,  1}}} 
+  }
+
+  activeGrip := -1
+  activeGripPtr := &activeGrip
+
+  for i, grip in eightGrips {
+    gripPos := r.getDims().mul(grip.position).add(r.getPos())
+    gripRect := rect::Rect{gripPos.x-6, gripPos.y-6, 12, 12}
+
+    ui.cellRect(gripRect)
+    ui.row(|i, activeGripPtr| {
+      ui.pushIdStr(sprintf("Grip%d", i))
+
+      if ui.isHovered() {
+        cursor := window::Cursor.sizeAll
+        switch i {
+        case 0, 7: cursor = .sizeNWSE
+        case 2, 5: cursor = .sizeSWNE
+        case 1, 6: cursor = .sizeNS
+        case 3, 4: cursor = .sizeEW
+        }
+        immcursor::setCursor(cursor)
+      }
+
+      color := th::blue
+
+      if ui.isActive() {
+        color = th::cyan
+        activeGripPtr ^= i
+      }
+
+      ui.drawCustom(|color| {
+        canvas::drawRect(color, dest.shrink({2, 2}))
+        canvas::drawRectLines(th::black, dest.shrink({2, 2}))
+      })
+
+      ui.popId()
+    })
+  }
+
+  if activeGrip == -1 {
+    return RectResizeCommand{}
+  }
+
+  return eightGrips[activeGrip].resizeCommand
+}
+
+fn (editor: ^Editor) putWorldEntities(ui: ^ui::UI) {
+  del := -1
+  delPtr := &del
+
+  for i, ent^ in editor.entities.list {
+    entSnappedRect := ent.rect
+    if input::isPressed(.ctrl) && (input::isPressed(.mouse1) || input::isJustReleased(.mouse1)) && editor.entities.entitySelected == i {
+      entSnappedRect = rect::Rect{
+        round(ent.rect.x/16.0)*16,
+        round(ent.rect.y/16.0)*16,
+        round(ent.rect.w/16.0)*16,
+        round(ent.rect.h/16.0)*16
+      }
+    }
+
+    entVisRect := util::rectScale(entSnappedRect, editor.tilemapGrid.s.x/32).shift(editor.tilemapGrid.toScreen(th::Vf2{0, 0}))
+
+    uiVisRect := entVisRect
+
+    uiVisRect.x /= ui.io.scale
+    uiVisRect.y /= ui.io.scale
+    uiVisRect.w /= ui.io.scale
+    uiVisRect.h /= ui.io.scale
+
+    // @FIXME: Initializing tag set every time we render an entity is not efficient at all.
+    tags_ := tagset::mk(ent.tags)
+    tags := new(tagset::TagSet, tags_)
+    ignore := tags.isSet("Guide") && editor.entityBypass && !isEntitySelected(&editor.entities, i)
+
+    ui.cellRect(uiVisRect)
+    ui.row(|i, ignore, editor, ent, uiVisRect, entVisRect, tags, delPtr, entSnappedRect| {
+      hovered := false
+      focused := false
+
+      if !ignore {
+        ui.pushIdStr(sprintf("Ent%v", ent))
+
+        if ui.isActive() && input::isPressed(.mouse1) {
+          editor.dirty = true
+          ent.rect = ent.rect.shift(input::getMouseDelta().divf(editor.tilemapGrid.s.x/32))
+        }
+
+        if input::isJustReleased(.mouse1) {
+          ent.rect = entSnappedRect
+        }
+
+        if ui.isFocused() {
+          focused = true
+
+          dx, dy := 0, 0
+          if input::isPressedRepeat(.up) {
+            dy += -1
+            input::clear(.up)
+          }
+          if input::isPressedRepeat(.down) {
+            dy += 1
+            input::clear(.down)
+          }
+          if input::isPressedRepeat(.right) {
+            dx += 1
+            input::clear(.right)
+          }
+          if input::isPressedRepeat(.left) {
+            dx += -1
+            input::clear(.left)
+          }
+
+          newRect := ent.rect
+
+          if input::isPressed(.alt) {
+            if dx != 0 {
+              newRect.w += dx*32
+              newRect.w = 32*round(newRect.w/32)
+            }
+            if dy != 0 {
+              newRect.h += dy*32
+              newRect.h = 32*round(newRect.h/32)
+            }
+          } else {
+            if dx != 0 {
+              newRect.x += dx*32
+              newRect.x = 32*round(newRect.x/32)
+            }
+            if dy != 0 {
+              newRect.y += dy*32
+              newRect.y = 32*round(newRect.y/32)
+            }
+          }
+
+          if dx != 0 || dy != 0 {
+            editor.transformEntity(ent.id, newRect)
+            editor.actionBuf.commit()
+          }
+
+          if input::isJustPressed(.delete) {
+            delPtr ^= i
+          }
+
+          if input::isPressed(.mouse1) {
+            doEntityAction(ui, editor, .edit, i)
+          }
+        }
+
+        if editor.entities.entitySelected == i {
+          rectCmd := editor.putRectGrips(ui, uiVisRect)
+          delta := input::getMouseDelta().div(editor.tilemapGrid.s).mulf(32)
+
+          ent.rect = applyRectResizeCommand(rectCmd, ent.rect, delta)
+
+          adjusted := adjustEntityRect(editor, tags, ent)
+          sizeD := adjusted.getDims().sub(ent.rect.getDims())
+          ent.rect = adjusted
+
+          if input::isPressed(.mouse1) {
+            editor.transformEntity(ent.id, {
+              ent.rect.x-rectCmd.posFactor.x*sizeD.x,
+              ent.rect.y-rectCmd.posFactor.y*sizeD.y,
+              ent.rect.w,
+              ent.rect.h,
+            })
+          }
+
+          if input::isJustReleased(.mouse1) {
+            editor.actionBuf.commit()
+          }
+        }
+
+        hovered = ui.isHovered()
+
+        if hovered {
+          // @HACK: This should be done in UI event interception.
+          wheel := input::getMouseScroll().y
+          editor.tilemapGrid.zoomInto(updateZoom(editor.tilemapGrid.s.x, wheel/10.0), input::getMousePos())
+        }
+
+        ui.popId()
+      }
+ 
+      entCopy := ent^
+      ui.drawCustom(|ignore, focused, hovered, editor, entCopy, entVisRect, tags| {
+        drawTaggedEntityRect(editor, &entCopy, entVisRect, tags)
+        if !ignore && tags.isSet("Guide") {
+          canvas::drawRect(0xFFFF0077, entVisRect)
+        }
+        if hovered {
+          canvas::drawRectLines(0xFFFF00FF, entVisRect)
+        }
+        if focused {
+          canvas::drawRectLines(0x00FFFFFF, entVisRect.shrink({-1, -1}))
+        }
+      })
+    })
+  }
+
+  if del != -1 {
+    editor.removeEntity(del)
+  }
+}
+
+fn (editor: ^Editor) putUi(ui: ^ui::UI) {
+  ui.col(|editor| {
+    ui.cellJustify(1)
+    ui.row(|editor| {
+      if !editor.isPlaying {
+        ui.cellStretch()
+        ui.cellJustify(1)
+        ui.row(|editor| {
+          ui.pushIdStr("Tilemap Editor")
+
+          ui.cellStretch()
+          ui.cellJustify(1)
+          interaction := putGrid(&editor.tilemapGrid, ui)
+
+          editor.hideWindows = interaction.panning
+
+          editor.putWorldEntities(ui)
+
+          if interaction.placed {
+            sx, sy := floor(interaction.pos.x), floor(interaction.pos.y)
+            tile := editor.tileset.index(editor.tileSelected)
+            // NOTE: Plus 2 is due to some weird translation in atlas um.
+            editor.setTile({sx, sy}, editor.tilemapLayer, tile+2)
+          }
+
+          if interaction.removed {
+            sx, sy := floor(interaction.pos.x), floor(interaction.pos.y)
+            editor.setTile({sx, sy}, editor.tilemapLayer, 0)
+          }
+
+          if interaction.commit {
+            editor.actionBuf.commit()
+          }
+
+          ui.drawCustom(|editor| {
+            WorldEditCmd{
+              getShownLayersBitmap(editor.tilemapLayer, editor.tilemapShowAllLayers),
+              dest,
+              editor.tilemapGrid,
+              &editor.world
+            }.draw({})
+
+            // Draw the bounding box
+            r := editor.world.getBoundingBox()
+            p1 := editor.tilemapGrid.toScreen(r.getPos())
+            p2 := editor.tilemapGrid.toScreen(r.getDims().add(r.getPos()))
+            canvas::drawRectLines(0xAAAAFF44, {p1.x, p1.y, p2.x-p1.x, p2.y-p1.y}, 2)
+          })
+
+          ui.popId()
+        })
+      } else {
+        ui.cellStretch()
+        ui.cellJustify(1)
+        ui.row({
+          ui.pushIdStr("Gameplay")
+          ui.drawCustom({
+            game::update()
+            GameCmd{}.draw({})
+          })
+          ui.popId()
+        })
+      }
+      ui.cellStretch()
+      editor.putToolbar(ui)
+    }, ui.io.screen.w)
+    ui.cellStretch()
+    ui.cellPadding(3)
+    ui.row(|editor| {
+      ui.boxStyle(.toolbar)
+      if payload_trigger::aprilFools() {
+        ui.label(sprintf("SPF: %g | ", 1/fps::getFps()))
+      } else {
+        ui.label(sprintf("FPS: %g | ", fps::getFps()))
+      }
+      ui.label(sprintf("MEM: %s | ", strings::formatBytes(memusage())))
+      ui.label(sprintf("ROOM: %s | ", editor.currentRoom))
+      if editor.dirty {
+        ui.cellColor(0xFF0000FF)
+        ui.label("Yo, save it")
+      }
+    })
+  }, ui.io.screen.h)
+
+  editor.putWindows(ui)
+  editor.putNotifications(ui)
+}
+
+fn editorSaveSession(editor: ^Editor): session::Session {
+  session := session::Session{}
+
+  session.pan           = editor.tilemapGrid.p
+  session.scale         = editor.tilemapGrid.s.x/editor.tilemapGrid.gs
+  session.room          = editor.currentRoom
+  session.allLayers     = editor.tilemapShowAllLayers
+  session.entityBypass  = editor.entityBypass
+  session.layerSelected = editor.tilemapLayer
+  session.tileSelected  = editor.tileSelected
+  session.showUiDebug   = editor.showUiDebugInfo
+  session.plainBiscuit  = global::plainBiscuit
+  session.mute          = editor.mute
+  session.windows       = implvtbl::VTBLImpl(editor.ui.vtbl).wm.saveState()
+
+  return session
+}
+
+fn editorLoadSession(editor: ^Editor, session: session::Session) {
+  loadRoom(editor, session.room)
+  scale := window::getDpiScaleFactor()-0.25
+  editor.tilemapGrid.p        = session.pan
+  editor.tilemapGrid.gs       = scale
+  editor.tilemapGrid.s.x      = session.scale*scale
+  editor.tilemapGrid.s.y      = session.scale*scale
+  editor.tilemapShowAllLayers = session.allLayers
+  editor.entityBypass         = session.entityBypass
+  editor.tilemapLayer         = session.layerSelected
+  editor.tileSelected         = session.tileSelected
+  editor.showUiDebugInfo      = session.showUiDebug
+  global::plainBiscuit        = session.plainBiscuit
+  editor.mute                 = session.mute
+
+  implvtbl::VTBLImpl(editor.ui.vtbl).wm.loadState(session.windows)
+}
+
+fn (editor: ^Editor) handleShortcuts*() {
+  shortcuts::console(&implvtbl::VTBLImpl(editor.ui.vtbl).wm)
+  shortcuts::debug(&implvtbl::VTBLImpl(editor.ui.vtbl).wm)
+  shortcuts::fullscreen()
+  if input::isJustPressed(.escape) {
+    if editor.entities.entitySelected != -1 {
+      input::clear(.escape)
+      editor.entities.entitySelected = -1
+    }
+  }
+  if input::isPressed(.ctrl) {
+    if input::isJustPressedc('a') {
+      input::clearc('a')
+      implvtbl::VTBLImpl(editor.ui.vtbl).wm.show("Quick Add")
+    }
+    if input::isJustPressedc('s') {
+      input::clearc('s')
+      editorSaveRoom(editor)
+    }
+    if input::isJustPressedc('q') {
+      input::clearc('q')
+      for _, w^ in implvtbl::VTBLImpl(editor.ui.vtbl).wm.windows {
+        w.hidden = true
+      }
+    }
+    if input::isJustPressedc('d') {
+      input::clearc('d')
+      idx := getEntitySelectedIndex(&editor.entities)
+      if idx != -1 {
+        doEntityAction(editor.ui, editor, .duplicate, idx)
+      }
+    }
+    if input::isPressedRepeatc('z') {
+      editor.actionBuf.undo()
+    }
+    if input::isPressedRepeatc('y') {
+      editor.actionBuf.redo()
+    }
+  }
+  if input::isJustPressed(.fn25) {
+    std::assert(false, "The F25 key? What's that?")
+  }
+  if input::isJustPressed(.pause) {
+    editorToggleGame(editor)
+  }
+  if input::isJustPressed(.fn5) {
+    editorToggleGame(editor)
+  }
+  if !input::isPressed(.alt) && input::isJustPressed(.fn4) {
+    editor.showUiDebugInfo = !editor.showUiDebugInfo
+  }
+  if input::isJustPressed(.fn3) {
+    editor.showDebugInfo = !editor.showDebugInfo
+  }
+  game::showDebug = editor.showDebugInfo
+  if input::isJustPressed(.fn2) {
+    global::plainBiscuit = !global::plainBiscuit
+  }
+  if input::isJustPressed(.fn1) {
+    dbg::logt("dfjslfkjsd")
+    notification::put({.warning, sprintf("Hello, world! %d", th::time)})
+  }
+}
+
+fn setup*() {
+  dpi := window::getDpiScaleFactor()
+  global::screen = {0, 0, 800*dpi, 600*dpi}
+  window::setup("Editor", trunc(global::screen.w), trunc(global::screen.h))
+}
+
+
+fn mk*(ui: ^ui::UI, rl: ^resources::ResourceLoader, doExit: ^bool): ^Editor {
+  // @TODO: Since we update DPI, we need to also update the resources.
+  resources := EditorResources {
+    tilesetImage: rl.loadImage("data/img/ts_sky.png", .linear),
+    toolbarIcons: rl.loadImage("data/img/ui/1_5x/icons.png", .linear),
+    superHotFire: rl.loadImage("data/img/SUPER HOT FIRE WTF.png", .linear),
+    pressFx:      rl.loadAudio("data/audio/sfx/press.ogg"),
+    releaseFx:    rl.loadAudio("data/audio/sfx/release.ogg"),
+    mainFont:     ui.font
+  }
+
+  tileset := atlas::mk(resources.tilesetImage, {4, 9})
+
+  scale := window::getDpiScaleFactor()-0.25
+
+  editor := &Editor{
+    doExit:               doExit,
+    ui:                   ui,
+    tilemapGrid:          grid::Grid{s: {48*scale, 48*scale}},
+    tilesetGrid:          grid::Grid{s: {48*scale, 48*scale}},
+    tilemapShowAllLayers: false,
+    entityBypass:         true,
+    tileset:              tileset,
+    world:                world::fromTileset(tileset),
+    resources:            resources,
+    entities:             createEditorEntities()
+  }
+
+  implvtbl::VTBLImpl(ui.vtbl).wm.windows["Quick Add"].hidden = true
+
+  // TODO: Should we handle the session loading here really?
+  if sessionFile, err := util::readFileStr(th::convPath("data://SAVESCUM/session.json")); err.code == 0 {
+    editorLoadSession(editor, session::load(sessionFile))
+  } else {
+    loadRoom(editor, "wip")
+  }
+
+  return editor
+}
+
+fn (editor: ^Editor) update*(uicb: fn(ui: ^ui::UI)) {
+  // Subsystem updates
+  notification::update()
+  fps::update()
+  payload_trigger::update()
+  immcursor::setCursor(.system)
+  editor.handleShortcuts()
+
+  std::srand(std::time())
+
+  editor.ui.io.scale = window::getDpiScaleFactor()/1.5
+  editor.ui.pass(|uicb, editor| {
+    editor.putUi(ui)
+    uicb(ui)
+  }, editor.showUiDebugInfo)
+
+  editor.actionBuf.flush(editor)
+
+  if !editor.mute {
+    for i, ev in editor.ui.events {
+      if ev.el.boxStyle == .button {
+        switch ev.kind {
+          case .pressed: sfx::startAtRandomPitch(editor.resources.pressFx)
+          case .released: sfx::startAtRandomPitch(editor.resources.releaseFx)
+        }
+      } else if ev.el.boxStyle == .buttonPushed {
+        switch ev.kind {
+          case .released: sfx::startAtRandomPitch(editor.resources.pressFx)
+          case .pressed: sfx::startAtRandomPitch(editor.resources.releaseFx)
+        }
+      }
+    }
+  }
+
+  if editor.showDebugInfo {
+    editor.dimDebugInfo = render_debug_info::renderDebugInfo(editor.resources.mainFont, {
+      displays: {
+        { "TPS", 1000.0/game::updateStepMs  },
+        { "Room", editor.currentRoom },
+        { "Frameskip", trunc(game::frameSkips) },
+        { "Version", global::version },
+        { "Scale", editor.tilemapGrid.s },
+        { "Plain", global::plainBiscuit },
+        { "Playthrough (ms)", editor.debugTimer.duration() },
+        { "Playthrough Started", editor.debugTimer.going }
+      }
+    }, editor.dimDebugInfo, editor.ui.io.scale)
+  }
+}
+
+fn (editor: ^Editor) destroy*() {
+  // HACK: Should the session managment be handled here?
+  if !os::isdir(th::convPath("data://SAVESCUM")) {
+    os::mkdir(th::convPath("data://SAVESCUM"))
+  }
+
+  path := th::convPath("data://SAVESCUM/session.json")
+  session := session::save(editorSaveSession(editor))
+  err := util::writeFileStr(path, session)
+  if err.code != 0 {
+    dbg::logt("Failed to save session!")
+  }
+
+  // Reset all the references to editor.
+  editor.ui = null
+}

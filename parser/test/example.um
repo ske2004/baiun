@@ -1,0 +1,29 @@
+import (
+  z = "std.um"
+  "adfasdf"
+)
+
+type (
+  X = struct {
+    t, p: int
+    x: []int
+    p: struct {
+      a: int
+      b: str
+    }
+  }
+
+  E = enum {
+    a; b; c;
+    d = 32; e = 62; f
+    g
+  }
+)
+
+var x: T = int(2 * 8 + 3 ? 3 : 2)
+
+var (
+  a, b: T = x[0]
+  b: T = x^
+  c: T = x(2)
+)
