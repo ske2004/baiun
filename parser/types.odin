@@ -89,7 +89,8 @@ Token :: struct {
 
 Parser :: struct {
 	src_iter: Src_Iter,
-	cur_token: Token
+	cur_token: Token,
+	errors: [dynamic]string
 }
 
 Parser_Restore_Point :: struct {

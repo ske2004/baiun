@@ -14,9 +14,13 @@ Ast_Type :: enum {
 	Number,
 	String,
 	Ternary,
+	Expr_List,
 	
 	Stmt_Group,
+	Expr_Group,
 	
+	For_Header,
+
 	Const_Stmt,
 	Fn_Stmt,
 	Import_Stmt,
@@ -25,7 +29,11 @@ Ast_Type :: enum {
 	For_Stmt,
 	If_Stmt,
 	Short_Var_Decl,
+	Short_Assignment,
 	Code_Block,
+
+	Increment,
+	Decrement,
 	
 	Const_Item,
 	Import_Item,

@@ -1,1 +1,1 @@
-odin run parser -- parser/tests/%1
+odin run parser -- %1

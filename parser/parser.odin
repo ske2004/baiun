@@ -4,6 +4,7 @@ import "core:fmt"
 
 Parser_Status :: enum {
 	Ok,
+	Lookahead_Failed, /// < sucks
 	Fail,
 }
 
@@ -22,13 +23,13 @@ expect_semi :: proc(parser: ^Parser, location := #caller_location) -> Parser_Sta
 parser_error :: proc(parser: ^Parser, msg: string, args: ..any, location := #caller_location) {
 	formatted := fmt.tprintf(msg, ..args)
 
-	error(
+	append(&parser.errors, fmt.tprintf(
 		"\x1b[31merror at %d:%d\x1b[0m: %s\n\x1b[32m%v\x1b[0m",
 		parser.cur_token.start.line + 1,
 		parser.cur_token.start.column + 1,
 		formatted,
 		location,
-	)
+	))
 }
 
 assert_next :: #force_inline proc(
@@ -119,10 +120,9 @@ parse_comma_delimited :: proc(parser: ^Parser, inner: Parser_Func, sentinel: Tok
 	ast = parent
 	skip_semi(parser)
 	
-	for {
+	for parser.cur_token.type != sentinel {
 		ast_append(ast, inner(parser) or_return)
 		skip_semi(parser)
-		// fmt.printf("here %v:%v %v\n", parser.src_iter.line, parser.src_iter.column, parser.cur_token.type)
 		
 		if parser.cur_token.type == .Comma {
 			assert_next(parser, .Comma)
@@ -484,13 +484,46 @@ parse_fn_stmt :: proc(parser: ^Parser) -> (ast: ^Ast, status: Parser_Status) {
 	return
 }
 
+// {expr [{',' expr}]}
 @(require_results)
-parse_short_var_decl :: proc(parser: ^Parser) -> (ast: ^Ast, status: Parser_Status) {
+parse_expr_list :: proc(parser: ^Parser) -> (ast: ^Ast, status: Parser_Status) {
+	ast = parse_expr(parser) or_return
+
+	if parser.cur_token.type == .Comma {
+		list := ast_alloc(.Expr_List)
+		ast_append(list, ast)
+		ast = list
+
+		for parser.cur_token.type == .Comma {
+			assert_next(parser, .Comma)
+			ast_append(ast, parse_expr(parser) or_return)
+		}
+	}
+
+	return
+}
+
+@(require_results)
+parse_short_assignment :: proc(parser: ^Parser) -> (ast: ^Ast, status: Parser_Status) {
 	ast = ast_alloc(.Short_Var_Decl, parser.cur_token)
-	parse_ident_or_ident_list()
-	expect_next(parser, .Ident) or_return
-	
-	ast_append(ast, parse_expr(parser) or_return)
+	ident_list, s := parse_ident_or_ident_list(parser)
+	if s != .Ok {
+		return ast, .Lookahead_Failed
+	}
+	ast_append(ast, ident_list)
+
+	if parser.cur_token.type == .Colon_Eq {
+		ast.type = .Short_Var_Decl
+		assert_next(parser, .Colon_Eq)
+	} else if parser.cur_token.type == .Eq {
+		ast.type = .Short_Assignment
+		assert_next(parser, .Eq)
+	} else {
+		parser_error(parser, "list assignment expected %v", parser.cur_token.type)
+		return ast, .Lookahead_Failed
+	}
+
+	ast_append(ast, parse_expr_list(parser) or_return)
 	return ast, .Ok
 }
 
@@ -498,9 +531,11 @@ parse_short_var_decl :: proc(parser: ^Parser) -> (ast: ^Ast, status: Parser_Stat
 parse_short_var_decl_epilogue :: proc(parser: ^Parser) -> (ast: ^Ast, status: Parser_Status) {
 	restore := parser_save(parser)
 	
-	ast, status = parse_short_var_decl(parser)
-	if status == .Ok {
-		return
+	ast, status = parse_short_assignment(parser)
+	switch status {
+	case .Ok: if ast.type == .Short_Var_Decl do return ast, .Ok
+	case .Lookahead_Failed: break
+	case .Fail: return ast, status 
 	}
 	
 	parser_restore(parser, restore)
@@ -508,28 +543,50 @@ parse_short_var_decl_epilogue :: proc(parser: ^Parser) -> (ast: ^Ast, status: Pa
 }
 
 @(require_results)
-parse_for_in_header :: proc(parser: ^Parser) -> (ast: ^Ast, status: Parser_Status) {
-	parse_short_var_decl()
-}
-
-@(require_results)
 parse_for_header :: proc(parser: ^Parser) -> (ast: ^Ast, status: Parser_Status) {
+	short_assignment := parse_short_var_decl_epilogue(parser) or_return
+
+	if short_assignment != nil {
+		expect_next(parser, .Semi) or_return
+	}
 	
+	expr := parse_expr(parser) or_return
+	stmt : ^Ast = nil
+
+	if parser.cur_token.type == .Semi {
+		assert_next(parser, .Semi)
+		stmt = parse_stmt(parser) or_return
+	}
+	
+	assert(
+		(short_assignment == nil && expr != nil && stmt == nil) || 
+		(short_assignment != nil && expr != nil && stmt == nil) || 
+		(short_assignment != nil && expr != nil && stmt != nil),
+		"Invalid for loop configuration"
+	)
+
+	ast = ast_alloc(.For_Header)
+	ast_append(ast, short_assignment)
+	ast_append(ast, expr)
+	ast_append(ast, stmt)
+
+	return
 }
 
 @(require_results)
 parse_for_stmt :: proc(parser: ^Parser) -> (ast: ^Ast, status: Parser_Status) {
 	assert_next(parser, .Kw_For)
-
 	ast = ast_alloc(.For_Stmt, parser.cur_token)
-	expect_next(parser, .Ident) or_return
-	
-	ast_append(ast, parse_for_signature(parser) or_return)
-	if parser.cur_token.type == .Lbrace {
-		ast_append(ast, parse_code_block(parser) or_return)
-	}
+
+	ast_append(ast, parse_for_header(parser) or_return)
+	ast_append(ast, parse_code_block(parser) or_return)
 
 	return
+}
+
+@(require_results)
+parse_designated_stmt :: proc(parser: ^Parser) -> (ast: ^Ast, status: Parser_Status) {
+	ast = parse_designator(parser)
 }
 
 @(require_results)
@@ -540,7 +597,8 @@ parse_stmt :: proc(parser: ^Parser) -> (ast: ^Ast, status: Parser_Status) {
 	case .Kw_Fn: ast = parse_fn_stmt(parser) or_return
 	case .Kw_For: ast = parse_for_stmt(parser) or_return
 	case .Lbrace: ast = parse_code_block(parser) or_return
-	case: parser_error(parser, "expected statement got %v", parser.cur_token.type)
+	case: ast = parse_designator(parser) or_return
+	// case: parser_error(parser, "expected statement got %v", parser.cur_token.type)
 	}
 	return
 }
@@ -548,7 +606,7 @@ parse_stmt :: proc(parser: ^Parser) -> (ast: ^Ast, status: Parser_Status) {
 @(require_results)
 parse_code_block :: proc(parser: ^Parser) -> (ast: ^Ast, status: Parser_Status) {
 	ast = ast_alloc(.Code_Block)
-	ast_append(ast, parse_braced_semi_group(parser, ast, parse_stmt) or_return)
+	ast = parse_braced_semi_group(parser, ast, parse_stmt) or_return
 	return
 }
 
